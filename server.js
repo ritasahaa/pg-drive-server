@@ -124,10 +124,14 @@ app.use('/api/notifications', notificationsRoutes);
 app.use('/api/user-loyalty', userLoyaltyRoutes);
 
 app.use('/api/stats', statsRouter);
+
+console.log("CONTENT ROUTE LOADED");
 app.use('/api/content', contentRoutes);
 
 
 mongoose.connection.on('connected', () => {
+    console.log("Database Name:", mongoose.connection.name);
+  console.log("Host:", mongoose.connection.host);
   console.log('MongoDB connected');
 });
 
