@@ -52,10 +52,11 @@ app.set('trust proxy', 1); // Fixes rate-limit X-Forwarded-For warning
 
 // Configure CORS properly for credentials
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://pgandbikerental.netlify.app/'],
+  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://pgandbikerental.netlify.app'],
   credentials: true,
 }));
 
+app.options("*", cors());
 app.use(express.json());
 app.use(rateLimiter);
 
