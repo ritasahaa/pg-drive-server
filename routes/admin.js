@@ -11,6 +11,7 @@ import EmailManager from '../modules/email/EmailManager.js';
 import { sendNotification } from '../utils/notificationService.js';
 import { logAction } from '../utils/auditLogService.js';
 import { Parser } from 'json2csv';
+import { generateOtp, hashOtp, normalizeOtpEmail, verifyOtpHash } from '../utils/otpSecurity.js';
 
 const router = express.Router();
 
@@ -18,14 +19,15 @@ const router = express.Router();
 router.post('/send-otp', async (req, res) => {
   try {
     const { email, password } = req.body;
+    const normalizedEmail = normalizeOtpEmail(email);
     
     // Input validation
-    if (!email || !password) {
+    if (!normalizedEmail || !password) {
       return res.status(400).json({ success: false, message: 'Email and password are required' });
     }
     
     // Check if admin exists
-    const admin = await Admin.findOne({ email });
+    const admin = await Admin.findOne({ email: normalizedEmail });
     if (!admin) {
       return res.status(400).json({ success: false, message: 'Invalid credentials' });
     }
@@ -39,7 +41,7 @@ router.post('/send-otp', async (req, res) => {
     // Rate limiting for admin (10 OTPs per hour)
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
     const otpCount = await Otp.countDocuments({ 
-      email, 
+      email: normalizedEmail, 
       role: 'admin',
       createdAt: { $gte: oneHourAgo } 
     });
@@ -52,24 +54,25 @@ router.post('/send-otp', async (req, res) => {
     }
 
     // Generate OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = generateOtp(6);
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes (already correct)
 
     // Delete any existing OTPs for this email
-    await Otp.deleteMany({ email, role: 'admin' });
+    await Otp.deleteMany({ email: normalizedEmail, role: 'admin' });
 
     // Save new OTP
     await Otp.create({
-      email,
-      otp,
+      email: normalizedEmail,
+      otpHash: hashOtp(normalizedEmail, otp),
       expiresAt,
-      role: 'admin'
+      role: 'admin',
+      purpose: 'admin-login'
     });
 
     // Send OTP email using Enhanced Email Manager
     try {
       await EmailManager.sendOTPEmail(
-        { email, name: 'Admin' }, 
+        { email: normalizedEmail, name: 'Admin' }, 
         otp, 
         'admin login',
         { useQueue: false } // High priority - immediate sending
@@ -77,8 +80,9 @@ router.post('/send-otp', async (req, res) => {
       
       res.json({ success: true, message: 'OTP sent to your email' });
     } catch (emailError) {
-      console.error('Admin OTP send error:', emailError);
-      res.status(500).json({ success: false, message: 'Failed to send OTP' });
+      await Otp.deleteMany({ email: normalizedEmail, role: 'admin', purpose: 'admin-login' });
+      console.error('Admin OTP email delivery failed');
+      res.status(502).json({ success: false, message: 'Failed to send OTP' });
     }
   } catch (error) {
     console.error('Admin OTP send error:', error);
@@ -90,9 +94,10 @@ router.post('/send-otp', async (req, res) => {
 router.post('/verify-otp', async (req, res) => {
   try {
     const { email, otp } = req.body;
+    const normalizedEmail = normalizeOtpEmail(email);
 
     // Input validation
-    if (!email || !otp) {
+    if (!normalizedEmail || !otp) {
       return res.status(400).json({ success: false, message: 'Email and OTP are required' });
     }
 
@@ -103,10 +108,11 @@ router.post('/verify-otp', async (req, res) => {
 
     // Check if OTP exists first (regardless of expiry)
     const existingOtp = await Otp.findOne({ 
-      email, 
-      otp, 
-      role: 'admin'
-    });
+      email: normalizedEmail,
+      role: 'admin',
+      purpose: 'admin-login',
+      used: false
+    }).sort({ createdAt: -1 }).select('+otpHash');
 
     if (!existingOtp) {
       return res.status(400).json({ success: false, message: 'Invalid OTP' });
@@ -119,13 +125,17 @@ router.post('/verify-otp', async (req, res) => {
       return res.status(400).json({ success: false, message: 'OTP has expired' });
     }
 
+    if (!verifyOtpHash(normalizedEmail, otp, existingOtp.otpHash)) {
+      return res.status(400).json({ success: false, message: 'Invalid OTP' });
+    }
+
     // Check if OTP was already used (if you have a 'used' field)
     if (existingOtp.used) {
       return res.status(400).json({ success: false, message: 'OTP already used' });
     }
 
     // Get admin details
-    const admin = await Admin.findOne({ email });
+    const admin = await Admin.findOne({ email: normalizedEmail });
     if (!admin) {
       return res.status(400).json({ success: false, message: 'Admin not found' });
     }

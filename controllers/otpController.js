@@ -9,22 +9,33 @@ import EmailManager from '../modules/email/EmailManager.js';
 import OtpAudit from '../models/OtpAudit.js';
 import axios from 'axios';
 import Settings from '../models/Settings.js';
+import { generateOtp, hashOtp, normalizeOtpEmail, verifyOtpHash } from '../utils/otpSecurity.js';
 
 // Helper: Audit log
 async function logOtpAction(email, action, status, message, req) {
-  await OtpAudit.create({
-    email,
-    action,
-    status,
-    message,
-    ip: req.ip || req.headers['x-forwarded-for'] || '',
-  });
+  if (!email) return;
+  try {
+    await OtpAudit.create({
+      email,
+      action,
+      status,
+      message,
+      ip: req.ip || req.headers['x-forwarded-for'] || '',
+    });
+  } catch {
+    console.error('OTP audit logging failed');
+  }
 }
 
 // Helper: Rate limit (role-based limits per hour)
 async function isRateLimited(email, role = 'user') {
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-  const count = await OtpAudit.countDocuments({ email, action: 'send', createdAt: { $gte: oneHourAgo } });
+  const count = await OtpAudit.countDocuments({
+    email,
+    action: { $in: ['send', 'resend'] },
+    status: 'success',
+    createdAt: { $gte: oneHourAgo }
+  });
   
   // Role-based rate limits
   let maxLimit;
@@ -49,10 +60,10 @@ async function getOtpSettings() {
   // Settings model se fetch karo, fallback default
   const settings = await Settings.findOne({ key: 'otp' });
   return {
-    length: settings?.length || 6,
-    expiry: settings?.expiry || 5 * 60, // seconds
-    retryLimit: settings?.retryLimit || 3,
-    webhookUrl: settings?.webhookUrl || '',
+    length: 6,
+    expiry: settings?.value?.expiry || 5 * 60, // seconds
+    retryLimit: settings?.value?.retryLimit || 3,
+    webhookUrl: settings?.value?.webhookUrl || '',
   };
 }
 
@@ -73,33 +84,25 @@ async function logAnalytics(email, action, status) {
   // ...implementation...
 }
 
-// Update OTP generation to use versioned settings
-function generateOtp(length = 6) {
-  let otp = '';
-  for (let i = 0; i < length; i++) {
-    otp += Math.floor(Math.random() * 10);
-  }
-  return otp;
-}
-
 async function sendOtp(req, res) {
-  const { email, role } = req.body;
+  const { email, role, purpose = 'registration' } = req.body;
   const userRole = role || 'user'; // Default to 'user' if role not provided
+  const normalizedEmail = normalizeOtpEmail(email);
   const tenantId = getTenantId(req);
-  const otpSettings = await getOtpSettings();
   
-  if (!email) {
-    await logOtpAction(email, 'send', 'error', 'Email required', req);
+  if (!normalizedEmail) {
     return res.status(400).json({ success: false, message: 'Email required' });
   }
+
+  const otpSettings = await getOtpSettings();
 
   // Note: Email existence check is now done separately via /check-email endpoint
   // This allows for better UX where users get immediate feedback before OTP is sent
   
-  if (await isRateLimited(email, userRole)) {
+  if (await isRateLimited(normalizedEmail, userRole)) {
     const limits = { user: 5, owner: 5, admin: 10 };
     const maxLimit = limits[userRole] || 5;
-    await logOtpAction(email, 'send', 'error', 'Rate limit exceeded', req);
+    await logOtpAction(normalizedEmail, 'send', 'error', 'Rate limit exceeded', req);
     return res.status(429).json({ 
       success: false, 
       message: `Too many OTP requests. Maximum ${maxLimit} OTPs per hour allowed for ${userRole}s.` 
@@ -108,75 +111,105 @@ async function sendOtp(req, res) {
   
   const otp = generateOtp(otpSettings.length);
   const expiresAt = new Date(Date.now() + otpSettings.expiry * 1000);
-  await Otp.deleteMany({ email });
-  await Otp.create({ email, otp, expiresAt, tenantId, role: userRole });
+  await Otp.deleteMany({ email: normalizedEmail });
+  const otpRecord = await Otp.create({
+    email: normalizedEmail,
+    otpHash: hashOtp(normalizedEmail, otp),
+    expiresAt,
+    tenantId,
+    role: userRole,
+    purpose
+  });
   
   // Send OTP email using Enhanced Email Manager
   try {
     await EmailManager.sendOTPEmail(
-      { email, name: 'User' }, 
+      { email: normalizedEmail, name: 'User' }, 
       otp, 
       'email verification',
       { useQueue: false } // High priority - immediate sending
     );
     
-    await logOtpAction(email, 'send', 'success', 'OTP sent successfully', req);
+    await logOtpAction(normalizedEmail, 'send', 'success', 'OTP sent successfully', req);
     return res.json({ success: true, message: 'OTP sent successfully' });
     
   } catch (emailError) {
-    // Email failed but OTP is still generated and stored
-    await logOtpAction(email, 'send', 'email_failed', `Email failed: ${emailError.message}`, req);
-    
-    return res.json({ 
-      success: true, 
-      message: 'OTP generated. Email service temporarily unavailable, but OTP is valid for verification.',
-      warning: 'Email delivery may be delayed'
+    await Otp.deleteOne({ _id: otpRecord._id });
+    await logOtpAction(normalizedEmail, 'send', 'email_failed', 'Email delivery failed', req);
+    return res.status(502).json({ 
+      success: false, 
+      message: 'Failed to send OTP email. Please try again.'
     });
   }
 };
 
 async function verifyOtp(req, res) {
-  const { email, otp } = req.body;
+  const { email, otp, role = 'user', purpose = 'registration' } = req.body;
+  const normalizedEmail = normalizeOtpEmail(email);
   const tenantId = getTenantId(req);
-  const record = await Otp.findOne({ email, otp, tenantId });
+  if (!normalizedEmail || !/^\d{6}$/.test(String(otp || ''))) {
+    return res.status(400).json({ success: false, message: 'Email and a valid 6-digit OTP are required' });
+  }
+
+  const otpSettings = await getOtpSettings();
+  const record = await Otp.findOne({
+    email: normalizedEmail,
+    tenantId,
+    role,
+    purpose,
+    used: false
+  }).sort({ createdAt: -1 }).select('+otpHash');
   if (!record) {
-    await logOtpAction(email, 'verify', 'error', 'Invalid OTP', req);
-    await logAnalytics(email, 'verify', 'error');
+    await logOtpAction(normalizedEmail, 'verify', 'error', 'Invalid OTP', req);
+    await logAnalytics(normalizedEmail, 'verify', 'error');
     return res.status(400).json({ success: false, message: 'Invalid OTP' });
   }
   if (record.expiresAt < new Date()) {
-    await logOtpAction(email, 'verify', 'error', 'OTP expired', req);
-    await logAnalytics(email, 'verify', 'error');
+    await Otp.deleteOne({ _id: record._id });
+    await logOtpAction(normalizedEmail, 'verify', 'error', 'OTP expired', req);
+    await logAnalytics(normalizedEmail, 'verify', 'error');
     return res.status(400).json({ success: false, message: 'OTP expired' });
   }
+
+  if (!verifyOtpHash(normalizedEmail, otp, record.otpHash)) {
+    record.attempts += 1;
+    if (record.attempts >= otpSettings.retryLimit) {
+      await Otp.deleteOne({ _id: record._id });
+    } else {
+      await record.save();
+    }
+    await logOtpAction(normalizedEmail, 'verify', 'error', 'Invalid OTP', req);
+    return res.status(400).json({ success: false, message: 'Invalid OTP' });
+  }
+
   record.verified = true;
   // Don't mark as used here - will be marked when used for registration
   await record.save();
-  await logOtpAction(email, 'verify', 'success', 'OTP verified', req);
-  await logAnalytics(email, 'verify', 'success');
+  await logOtpAction(normalizedEmail, 'verify', 'success', 'OTP verified', req);
+  await logAnalytics(normalizedEmail, 'verify', 'success');
   // Webhook trigger
-  const otpSettings = await getOtpSettings();
   if (otpSettings.webhookUrl) {
-    axios.post(otpSettings.webhookUrl, { email, tenantId, event: 'otp_verified', time: new Date() }).catch(() => {});
+    axios.post(otpSettings.webhookUrl, { email: normalizedEmail, tenantId, event: 'otp_verified', time: new Date() }).catch(() => {});
   }
   res.json({ success: true, message: 'OTP verified' });
 };
 
 async function resendOtp(req, res) {
-  const { email, role } = req.body;
+  const { email, role, purpose = 'registration' } = req.body;
   const userRole = role || 'user'; // Default to 'user' if role not provided
+  const normalizedEmail = normalizeOtpEmail(email);
   const tenantId = getTenantId(req);
-  const otpSettings = await getOtpSettings();
   
-  if (!email) {
-    await logOtpAction(email, 'resend', 'error', 'Email required', req);
+  if (!normalizedEmail) {
     return res.status(400).json({ success: false, message: 'Email required' });
   }
+
+  const otpSettings = await getOtpSettings();
   
-  if (await isRateLimited(email, userRole)) {
+  if (await isRateLimited(normalizedEmail, userRole)) {
     const limits = { user: 5, owner: 5, admin: 10 };
     const maxLimit = limits[userRole] || 5;
-    await logOtpAction(email, 'resend', 'error', 'Rate limit exceeded', req);
+    await logOtpAction(normalizedEmail, 'resend', 'error', 'Rate limit exceeded', req);
     return res.status(429).json({ 
       success: false, 
       message: `Too many OTP requests. Maximum ${maxLimit} OTPs per hour allowed for ${userRole}s.` 
@@ -185,27 +218,35 @@ async function resendOtp(req, res) {
   
   const otp = generateOtp(otpSettings.length);
   const expiresAt = new Date(Date.now() + otpSettings.expiry * 1000);
-  await Otp.deleteMany({ email });
-  await Otp.create({ email, otp, expiresAt, tenantId, role: userRole });
+  await Otp.deleteMany({ email: normalizedEmail });
+  const otpRecord = await Otp.create({
+    email: normalizedEmail,
+    otpHash: hashOtp(normalizedEmail, otp),
+    expiresAt,
+    tenantId,
+    role: userRole,
+    purpose
+  });
   
   // Send OTP email using Enhanced Email Manager
   try {
     await EmailManager.sendOTPEmail(
-      { email, name: 'User' }, 
+      { email: normalizedEmail, name: 'User' }, 
       otp, 
       'OTP resend request',
       { useQueue: false } // High priority - immediate sending
     );
     
-    await logOtpAction(email, 'resend', 'success', 'OTP resent', req);
-    await logAnalytics(email, 'resend', 'success');
+    await logOtpAction(normalizedEmail, 'resend', 'success', 'OTP resent', req);
+    await logAnalytics(normalizedEmail, 'resend', 'success');
     res.json({ success: true, message: 'OTP resent' });
     
   } catch (emailError) {
-    await logOtpAction(email, 'resend', 'email_failed', `Email failed: ${emailError.message}`, req);
-    res.json({ 
-      success: true, 
-      message: 'OTP generated. Email service temporarily unavailable, but OTP is valid for verification.' 
+    await Otp.deleteOne({ _id: otpRecord._id });
+    await logOtpAction(normalizedEmail, 'resend', 'email_failed', 'Email delivery failed', req);
+    res.status(502).json({ 
+      success: false,
+      message: 'Failed to resend OTP email. Please try again.' 
     });
   }
 };
@@ -214,8 +255,9 @@ async function resendOtp(req, res) {
 async function checkEmailExists(req, res) {
   const { email, role } = req.body;
   const userRole = role || 'user';
+  const normalizedEmail = normalizeOtpEmail(email);
 
-  if (!email) {
+  if (!normalizedEmail) {
     return res.status(400).json({ success: false, message: 'Email required' });
   }
 
@@ -225,11 +267,11 @@ async function checkEmailExists(req, res) {
     // Check based on role
     if (userRole === 'owner') {
       // For owners, check both User table (with role='owner') and OwnerProfile table
-      existingUser = await User.findOne({ email, role: 'owner' }) || 
-                     await OwnerProfile.findOne({ email });
+      existingUser = await User.findOne({ email: normalizedEmail, role: 'owner' }) || 
+                     await OwnerProfile.findOne({ email: normalizedEmail });
     } else {
       // For users and admins, check User table
-      existingUser = await User.findOne({ email, role: userRole });
+      existingUser = await User.findOne({ email: normalizedEmail, role: userRole });
     }
     
     if (existingUser) {

@@ -10,6 +10,8 @@ import EmailManager from '../modules/email/EmailManager.js';
 import rateLimit from 'express-rate-limit';
 import { isValidIndianMobile, getNormalizedMobile } from '../utils/mobileValidation.js';
 import { validateName, formatName, processName } from '../utils/nameValidation.js';
+import Otp from '../models/Otp.js';
+import { normalizeOtpEmail, verifyOtpHash } from '../utils/otpSecurity.js';
 
 const router = express.Router();
 
@@ -48,37 +50,26 @@ router.post('/register', async (req, res) => {
     termsAccepted,
     otp // Add OTP field for verification
   } = req.body;
+  const normalizedEmail = normalizeOtpEmail(email);
   try {
-    // Debug logging
-    console.log('Registration request body:', req.body);
-    console.log('OTP received:', otp);
-    console.log('Email received:', email);
-    
     // Check if OTP is provided and valid
     if (!otp) {
-      console.log('No OTP provided in request');
       return res.status(400).json({ error: 'Email verification OTP is required.' });
     }
 
     // Verify OTP first - check for verified and unused OTP
-    const otpRecord = await import('../models/Otp.js').then(m => m.default);
-    const validOtp = await otpRecord.findOne({ 
-      email, 
-      otp, 
+    const validOtp = await Otp.findOne({ 
+      email: normalizedEmail,
+      role: role || 'user',
+      purpose: 'registration',
       verified: true,  // Changed to true since we need verified OTP for registration
       used: false,     // Must not be used before
       expiresAt: { $gt: new Date() }
-    });
+    }).sort({ createdAt: -1 }).select('+otpHash');
 
-    if (!validOtp) {
+    if (!validOtp || !verifyOtpHash(normalizedEmail, otp, validOtp.otpHash)) {
       return res.status(400).json({ error: 'Invalid or expired OTP. Please verify your email first.' });
     }
-
-    // Mark OTP as used to prevent reuse
-    await otpRecord.updateOne(
-      { _id: validOtp._id },
-      { used: true, usedAt: new Date() }
-    );
 
     // Password strength validation
     if (!password || password.length < 8) {
@@ -126,7 +117,7 @@ router.post('/register', async (req, res) => {
       }
       user = new User({
         name: formattedOwnerName,
-        email,
+        email: normalizedEmail,
         password_hash,
         phone: normalizedPhone,
         role,
@@ -139,7 +130,7 @@ router.post('/register', async (req, res) => {
     } else {
       user = new User({
         name: formattedName,
-        email,
+        email: normalizedEmail,
         password_hash,
         phone: normalizedPhone,
         role: role || 'user',
@@ -154,12 +145,15 @@ router.post('/register', async (req, res) => {
       await user.save();
     }
 
-    // Mark OTP as verified and cleanup
+    // Consume the OTP only after registration succeeds. Validation or save
+    // failures must not force the user to request another OTP.
     validOtp.verified = true;
+    validOtp.used = true;
+    validOtp.usedAt = new Date();
     await validOtp.save();
     
     // Clean up all OTPs for this email
-    await otpRecord.deleteMany({ email });
+    await Otp.deleteMany({ email: normalizedEmail });
 
     // Send welcome email using Enhanced Email Manager
     try {

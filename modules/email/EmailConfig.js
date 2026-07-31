@@ -141,7 +141,7 @@ export const EMAIL_DATA_GENERATORS = {
     role: user.role,
     otp: otp,
     purpose: purpose,
-    expiryMinutes: 10
+    expiryMinutes: 5
   }),
 
   bookingEmail: (user, booking, additionalData = {}) => ({

@@ -23,7 +23,12 @@ class EmailService {
       const html = emailTemplates[templateName](templateData);
       
       // Send email
-      await sendEmail({ to, subject, html, attachmentBuffer });
+      const deliveryResult = await sendEmail({ to, subject, html, attachmentBuffer });
+      if (!deliveryResult?.success) {
+        const deliveryError = new Error('Email delivery failed');
+        deliveryError.code = deliveryResult?.code;
+        throw deliveryError;
+      }
 
       // Log success
       await this.logEmail({

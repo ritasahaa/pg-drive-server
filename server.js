@@ -50,13 +50,30 @@ dotenv.config({ quiet: true });
 const app = express();
 app.set('trust proxy', 1); // Fixes rate-limit X-Forwarded-For warning
 
-// Configure CORS properly for credentials
-app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://pgandbikerental.netlify.app'],
+// Configure CORS consistently for local development and deployed clients.
+const configuredOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+const allowedOrigins = new Set([
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:4173',
+  'https://pgbike.netlify.app',
+  'https://pgandbikerental.netlify.app',
+  ...configuredOrigins,
+]);
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error('Origin is not allowed by CORS'));
+  },
   credentials: true,
-}));
+};
 
-app.options("*", cors());
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json());
 app.use(rateLimiter);
 
